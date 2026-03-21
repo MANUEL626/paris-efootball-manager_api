@@ -9,3 +9,6 @@ email-validator
 # Supabase
 supabase~=2.10.0
 python-dotenv
+
+# HTTP requests (pour renvoi d'email de confirmation)
+requests
