@@ -2,9 +2,15 @@
 Routes FastAPI pour l'authentification et l'inscription
 """
 
-from fastapi import APIRouter, HTTPException, status
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from uuid import UUID
+
+from config.supabase_client import supabase_admin
 from features.auth.auth_service import AuthService
+from features.auth.internal_bearer import require_internal_bearer
+from features.users.users_model import UserProfileAggregatedResponse, UserType
 from features.auth.auth_models import (
     SignUpRequest,
     SignUpResponse,
@@ -20,6 +26,85 @@ router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 
 # Instance du service d'authentification
 auth_service = AuthService()
+
+
+def _fetch_aggregate_profile(client, user_id: UUID) -> Optional[Dict[str, Any]]:
+    """Assemble users + players ou admins. Retourne None si aucune ligne `users` pour cet id."""
+    ures = (
+        client.table("users")
+        .select("*")
+        .eq("id", str(user_id))
+        .limit(1)
+        .execute()
+    )
+    rows = ures.data or []
+    if not rows:
+        return None
+    user = rows[0]
+
+    uid = str(user_id)
+    utype = user.get("user_type")
+    player_id = None
+    username = None
+    admin_id = None
+
+    # user_params peut ne pas exister si l'onboarding n'a pas été fait.
+    upres = (
+        client.table("user_params")
+        .select("is_params_done")
+        .eq("user_id", uid)
+        .limit(1)
+        .execute()
+    )
+    up_rows = upres.data or []
+    is_params_done = (up_rows[0].get("is_params_done") if up_rows else False)
+
+    if utype == UserType.player.value:
+        pres = client.table("players").select("id,username").eq("user_id", uid).limit(1).execute()
+        row = (pres.data or [None])[0]
+        if row:
+            player_id = row.get("id")
+            username = row.get("username")
+    elif utype in (UserType.admin.value, UserType.super_admin.value):
+        ares = client.table("admins").select("id").eq("user_id", uid).limit(1).execute()
+        row = (ares.data or [None])[0]
+        if row:
+            admin_id = row.get("id")
+
+    return {
+        "user_id": user["id"],
+        "email": user["email"],
+        "first_name": user["first_name"],
+        "last_name": user["last_name"],
+        "phone": user.get("phone"),
+        "user_type": user["user_type"],
+        "activity_status": user["activity_status"],
+        "profile_picture": user.get("profile_picture"),
+        "created_at": user["created_at"],
+        "is_params_done": is_params_done,
+        "player_id": player_id,
+        "username": username,
+        "admin_id": admin_id,
+    }
+
+
+@router.get("/profile/{user_id}", response_model=UserProfileAggregatedResponse)
+def get_user_profile_aggregate(
+    user_id: UUID,
+    _: None = Depends(require_internal_bearer),
+):
+    """
+    Profil agrégé (`public.users` + `players` ou `admins`).
+
+    **Auth :** `Authorization: Bearer <INTERNAL_API_BEARER>` (secret partagé configuré côté serveur,
+    défaut dev : `dev-internal-bearer`). Ce n’est pas le JWT Supabase utilisateur.
+
+    Données lues avec la **service role** (bypass RLS). En prod : définir `INTERNAL_API_BEARER` dans `.env`.
+    """
+    payload = _fetch_aggregate_profile(supabase_admin, user_id)
+    if not payload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Utilisateur non trouvé")
+    return UserProfileAggregatedResponse.model_validate(payload)
 
 
 @router.post("/signup", response_model=SignUpResponse, status_code=status.HTTP_201_CREATED)

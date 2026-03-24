@@ -3,9 +3,10 @@ Configuration du client Supabase pour le projet
 Ce fichier peut être importé dans n'importe quel module du projet
 """
 
-from supabase import create_client, Client
 import os
+
 from dotenv import load_dotenv
+from supabase import Client, ClientOptions, create_client
 
 # Charger les variables d'environnement depuis un fichier .env
 load_dotenv()
@@ -26,6 +27,13 @@ SUPABASE_SERVICE_KEY = os.getenv(
     "SUPABASE_SERVICE_KEY",
     # Clé service par défaut pour Supabase local (développement uniquement)
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
+)
+
+# Secret partagé mobile ↔ backend (Authorization: Bearer …). Ce n’est pas le JWT Supabase.
+# En prod : définir INTERNAL_API_BEARER dans .env (valeur longue et aléatoire).
+_INTERNAL_API_BEARER_RAW = os.getenv("INTERNAL_API_BEARER", "").strip()
+INTERNAL_API_BEARER = (
+    _INTERNAL_API_BEARER_RAW if _INTERNAL_API_BEARER_RAW else "dev-internal-bearer"
 )
 
 
@@ -52,53 +60,28 @@ def get_supabase_client(use_service_key: bool = False) -> Client:
 
 def get_supabase_client_with_token(access_token: str) -> Client:
     """
-    Crée et retourne une instance du client Supabase configurée avec un token JWT.
-    Ce client respecte les politiques RLS avec l'identité de l'utilisateur authentifié.
+    Crée un client Supabase dont les requêtes PostgREST envoient le JWT utilisateur dans
+    ``Authorization: Bearer <access_token>`` (RLS : ``auth.uid()`` = l’utilisateur du token).
 
-    Args:
-        access_token: Token JWT de l'utilisateur authentifié (format: "Bearer <token>" ou juste "<token>")
+    Important : on n’utilise pas ``auth.set_session()`` ici. ``set_session`` déclenche un appel
+    ``GET /auth/v1/user`` sur GoTrue ; en cas d’erreur réseau / 520, le JWT n’était pas appliqué
+    aux appels ``rest/v1``, donc la RLS masquait les lignes et ``.single()`` sur ``users`` renvoyait
+    **406 Not Acceptable** (PostgREST : 0 ligne avec ``Accept: application/vnd.pgrst.object+json``).
 
-    Returns:
-        Client: Instance du client Supabase configurée avec le token
-
-    Note:
-        Ce client permet aux politiques RLS d'identifier l'utilisateur via auth.uid()
+    En passant le Bearer via ``ClientOptions``, ``create_client`` n’essaie pas de résoudre la session
+    GoTrue et PostgREST reçoit directement le bon en-tête.
     """
-    # Nettoyer le token (enlever "Bearer " si présent)
     token = access_token.replace("Bearer ", "").strip() if access_token else ""
 
     if not token:
-        # Si pas de token, retourner le client normal
         return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-    # Créer le client
-    client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-    # Configurer la session avec le token pour que RLS fonctionne
-    # Essayer d'abord set_session, puis modifier les headers si nécessaire
-    try:
-        # set_session attend (access_token, refresh_token)
-        # On utilise le même token pour les deux car on n'a que l'access_token
-        client.auth.set_session(token, token)
-    except Exception:
-        # Si set_session échoue, modifier les headers HTTP directement
-        # Le client Supabase utilise postgrest qui a une session HTTP
-        try:
-            # Accéder au client postgrest interne et modifier ses headers
-            if hasattr(client, 'table'):
-                # Créer une table temporaire pour accéder au client interne
-                temp_table = client.table('_dummy_table_for_header_config')
-                if hasattr(temp_table, '_client') and hasattr(temp_table._client, 'session'):
-                    temp_table._client.session.headers.update({
-                        'Authorization': f'Bearer {token}',
-                        'apikey': SUPABASE_ANON_KEY
-                    })
-        except Exception:
-            # Si tout échoue, on retourne le client tel quel
-            # L'utilisateur devra utiliser supabase_admin à la place
-            pass
-
-    return client
+    options = ClientOptions(
+        persist_session=False,
+        auto_refresh_token=False,
+    )
+    options.headers = {**options.headers, "Authorization": f"Bearer {token}"}
+    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options)
 
 
 # Instance globale du client avec ANON_KEY (par défaut, respecte RLS)
